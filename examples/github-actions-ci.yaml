@@ -1,0 +1,42 @@
+name: KIND CI Example
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install KIND
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create KIND cluster
+        run: |
+          kind create cluster --name ci-test --wait 5m
+
+      - name: Wait for cluster ready
+        run: |
+          kubectl wait --for=condition=Ready nodes --all --timeout=5m
+
+      - name: Deploy application
+        run: |
+          kubectl apply -f k8s/
+
+      - name: Run tests
+        run: |
+          # Your test commands here
+          kubectl get pods --all-namespaces
+          kubectl get services --all-namespaces
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name ci-test
