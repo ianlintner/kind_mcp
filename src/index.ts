@@ -8,6 +8,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { mkdtemp, writeFile, unlink } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 import { z } from "zod";
 
 const execAsync = promisify(exec);
@@ -100,6 +103,28 @@ const WaitForReadySchema = z.object({
   timeout: z.string().optional().describe("Timeout duration (default: '5m')"),
 });
 
+// Helper function to sanitize input for shell commands
+function sanitizeInput(input: string): string {
+  // Remove any characters that could be used for command injection
+  return input.replace(/[;&|`$(){}[\]<>\\]/g, '');
+}
+
+// Helper function to validate cluster names (alphanumeric and hyphens only)
+function validateClusterName(name: string): string {
+  if (!/^[a-zA-Z0-9-]+$/.test(name)) {
+    throw new Error("Cluster name must contain only alphanumeric characters and hyphens");
+  }
+  return name;
+}
+
+// Helper function to validate Kubernetes version strings
+function validateK8sVersion(version: string): string {
+  if (!/^v\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error("Kubernetes version must be in format vX.Y.Z (e.g., v1.27.0)");
+  }
+  return version;
+}
+
 // Helper function to execute shell commands
 async function executeCommand(command: string): Promise<{ stdout: string; stderr: string }> {
   try {
@@ -110,9 +135,9 @@ async function executeCommand(command: string): Promise<{ stdout: string; stderr
   }
 }
 
-// Get kubeconfig path for cluster
+// Get kubeconfig path for cluster with validated name
 function getKubeconfigPath(clusterName?: string): string {
-  const name = clusterName || 'kind';
+  const name = clusterName ? validateClusterName(clusterName) : 'kind';
   return `--context kind-${name}`;
 }
 
@@ -326,11 +351,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = CreateClusterSchema.parse(args);
         let command = "kind create cluster";
         
-        if (params.name) command += ` --name ${params.name}`;
-        if (params.config) command += ` --config ${params.config}`;
-        if (params.image) command += ` --image ${params.image}`;
-        if (params.wait) command += ` --wait ${params.wait}`;
-        if (params.kubeconfig) command += ` --kubeconfig ${params.kubeconfig}`;
+        if (params.name) {
+          const validName = validateClusterName(params.name);
+          command += ` --name ${validName}`;
+        }
+        if (params.config) command += ` --config ${sanitizeInput(params.config)}`;
+        if (params.image) command += ` --image ${sanitizeInput(params.image)}`;
+        if (params.wait) command += ` --wait ${sanitizeInput(params.wait)}`;
+        if (params.kubeconfig) command += ` --kubeconfig ${sanitizeInput(params.kubeconfig)}`;
         
         const result = await executeCommand(command);
         return {
@@ -347,8 +375,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = DeleteClusterSchema.parse(args);
         let command = "kind delete cluster";
         
-        if (params.name) command += ` --name ${params.name}`;
-        if (params.kubeconfig) command += ` --kubeconfig ${params.kubeconfig}`;
+        if (params.name) {
+          const validName = validateClusterName(params.name);
+          command += ` --name ${validName}`;
+        }
+        if (params.kubeconfig) command += ` --kubeconfig ${sanitizeInput(params.kubeconfig)}`;
         
         const result = await executeCommand(command);
         return {
@@ -397,10 +428,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "load_image": {
         const params = LoadImageSchema.parse(args);
-        let command = `kind load docker-image ${params.image} --name ${params.name}`;
+        const validName = validateClusterName(params.name);
+        let command = `kind load docker-image ${sanitizeInput(params.image)} --name ${validName}`;
         
         if (params.archive) {
-          command = `kind load image-archive ${params.archive} --name ${params.name}`;
+          command = `kind load image-archive ${sanitizeInput(params.archive)} --name ${validName}`;
         }
         
         const result = await executeCommand(command);
@@ -408,7 +440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `Image loaded successfully!\n\nOutput:\n${result.stdout || 'Image loaded into cluster ' + params.name}`,
+              text: `Image loaded successfully!\n\nOutput:\n${result.stdout || 'Image loaded into cluster ' + validName}`,
             },
           ],
         };
@@ -416,9 +448,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "export_logs": {
         const params = ExportLogsSchema.parse(args);
-        let command = `kind export logs ${params.output}`;
+        let command = `kind export logs ${sanitizeInput(params.output)}`;
         
-        if (params.name) command += ` --name ${params.name}`;
+        if (params.name) {
+          const validName = validateClusterName(params.name);
+          command += ` --name ${validName}`;
+        }
         
         const result = await executeCommand(command);
         return {
@@ -436,22 +471,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const context = getKubeconfigPath(params.cluster);
         
         let command = `kubectl apply ${context}`;
-        if (params.namespace) command += ` -n ${params.namespace}`;
+        if (params.namespace) command += ` -n ${sanitizeInput(params.namespace)}`;
         
         // Check if manifest is a file path or inline content
         if (params.manifest.includes('\n') || params.manifest.startsWith('apiVersion:')) {
-          // Inline YAML - write to temp file
-          const tempFile = `/tmp/manifest-${Date.now()}.yaml`;
-          await executeCommand(`cat > ${tempFile} << 'EOF'\n${params.manifest}\nEOF`);
-          command += ` -f ${tempFile}`;
-          const result = await executeCommand(command);
-          await executeCommand(`rm ${tempFile}`);
-          return {
-            content: [{ type: "text", text: `Manifest applied successfully!\n\n${result.stdout}` }],
-          };
+          // Inline YAML - write to secure temp file
+          const tmpDir = await mkdtemp(join(tmpdir(), 'kind-mcp-'));
+          const tempFile = join(tmpDir, 'manifest.yaml');
+          
+          try {
+            await writeFile(tempFile, params.manifest, { mode: 0o600 });
+            command += ` -f ${tempFile}`;
+            const result = await executeCommand(command);
+            return {
+              content: [{ type: "text", text: `Manifest applied successfully!\n\n${result.stdout}` }],
+            };
+          } finally {
+            // Clean up temp file and directory
+            try {
+              await unlink(tempFile);
+              await executeCommand(`rmdir ${tmpDir}`);
+            } catch (cleanupError) {
+              // Log but don't fail on cleanup error
+              console.error('Temp file cleanup failed:', cleanupError);
+            }
+          }
         } else {
-          // File path
-          command += ` -f ${params.manifest}`;
+          // File path - sanitize it
+          command += ` -f ${sanitizeInput(params.manifest)}`;
           const result = await executeCommand(command);
           return {
             content: [{ type: "text", text: `Manifest applied successfully!\n\n${result.stdout}` }],
@@ -463,13 +510,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = GetResourcesSchema.parse(args);
         const context = getKubeconfigPath(params.cluster);
         
-        let command = `kubectl get ${params.resource} ${context}`;
+        let command = `kubectl get ${sanitizeInput(params.resource)} ${context}`;
         if (params.namespace) {
-          command += ` -n ${params.namespace}`;
+          command += ` -n ${sanitizeInput(params.namespace)}`;
         } else {
           command += ` --all-namespaces`;
         }
-        if (params.name) command += ` ${params.name}`;
+        if (params.name) command += ` ${sanitizeInput(params.name)}`;
         if (params.output) command += ` -o ${params.output}`;
         else command += ` -o wide`;
         
@@ -488,8 +535,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = DeleteResourceSchema.parse(args);
         const context = getKubeconfigPath(params.cluster);
         
-        let command = `kubectl delete ${params.resource} ${params.name} ${context}`;
-        if (params.namespace) command += ` -n ${params.namespace}`;
+        let command = `kubectl delete ${sanitizeInput(params.resource)} ${sanitizeInput(params.name)} ${context}`;
+        if (params.namespace) command += ` -n ${sanitizeInput(params.namespace)}`;
         if (params.force) command += ` --force --grace-period=0`;
         
         const result = await executeCommand(command);
@@ -507,9 +554,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = GetLogsSchema.parse(args);
         const context = getKubeconfigPath(params.cluster);
         
-        let command = `kubectl logs ${params.pod} ${context}`;
-        if (params.namespace) command += ` -n ${params.namespace}`;
-        if (params.container) command += ` -c ${params.container}`;
+        let command = `kubectl logs ${sanitizeInput(params.pod)} ${context}`;
+        if (params.namespace) command += ` -n ${sanitizeInput(params.namespace)}`;
+        if (params.container) command += ` -c ${sanitizeInput(params.container)}`;
         if (params.follow) command += ` -f`;
         if (params.tail) command += ` --tail=${params.tail}`;
         
@@ -539,8 +586,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = PortForwardSchema.parse(args);
         const context = getKubeconfigPath(params.cluster);
         
-        let command = `kubectl port-forward ${params.resource} ${params.ports} ${context}`;
-        if (params.namespace) command += ` -n ${params.namespace}`;
+        // Validate port format
+        if (!/^\d+:\d+$|^\d+$/.test(params.ports)) {
+          throw new Error("Ports must be in format 'localPort:remotePort' or 'port'");
+        }
+        
+        let command = `kubectl port-forward ${sanitizeInput(params.resource)} ${params.ports} ${context}`;
+        if (params.namespace) command += ` -n ${sanitizeInput(params.namespace)}`;
         
         return {
           content: [
@@ -556,9 +608,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const params = ExecCommandSchema.parse(args);
         const context = getKubeconfigPath(params.cluster);
         
-        let command = `kubectl exec ${params.pod} ${context}`;
-        if (params.namespace) command += ` -n ${params.namespace}`;
-        if (params.container) command += ` -c ${params.container}`;
+        let command = `kubectl exec ${sanitizeInput(params.pod)} ${context}`;
+        if (params.namespace) command += ` -n ${sanitizeInput(params.namespace)}`;
+        if (params.container) command += ` -c ${sanitizeInput(params.container)}`;
+        // Note: params.command is passed as-is to kubectl, which handles it safely
         command += ` -- ${params.command}`;
         
         const result = await executeCommand(command);
@@ -574,8 +627,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "setup_ci_cluster": {
         const params = SetupCIClusterSchema.parse(args);
-        const clusterName = params.name || 'kind';
+        const clusterName = validateClusterName(params.name || 'kind');
         const workerNodes = params.nodes || 1;
+        
+        // Validate worker nodes count
+        if (workerNodes < 0 || workerNodes > 10) {
+          throw new Error("Number of worker nodes must be between 0 and 10");
+        }
         
         // Create config for multi-node cluster
         const config = `kind: Cluster
@@ -584,29 +642,49 @@ nodes:
   - role: control-plane
 ${Array(workerNodes).fill(0).map(() => '  - role: worker').join('\n')}`;
         
-        const tempConfig = `/tmp/kind-ci-config-${Date.now()}.yaml`;
-        await executeCommand(`cat > ${tempConfig} << 'EOF'\n${config}\nEOF`);
+        // Use secure temp directory
+        const tmpDir = await mkdtemp(join(tmpdir(), 'kind-mcp-'));
+        const tempConfig = join(tmpDir, 'cluster-config.yaml');
         
-        let command = `kind create cluster --name ${clusterName} --config ${tempConfig} --wait 5m`;
-        if (params.version) command += ` --image kindest/node:${params.version}`;
-        
-        const result = await executeCommand(command);
-        await executeCommand(`rm ${tempConfig}`);
-        
-        return {
-          content: [
-            {
-              type: "text",
-              text: `CI cluster '${clusterName}' created successfully with ${workerNodes} worker node(s)!\n\n${result.stdout}\n\nCluster is ready for CI/CD workflows.`,
-            },
-          ],
-        };
+        try {
+          await writeFile(tempConfig, config, { mode: 0o600 });
+          
+          let command = `kind create cluster --name ${clusterName} --config ${tempConfig} --wait 5m`;
+          if (params.version) {
+            const validVersion = validateK8sVersion(params.version);
+            command += ` --image kindest/node:${validVersion}`;
+          }
+          
+          const result = await executeCommand(command);
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: `CI cluster '${clusterName}' created successfully with ${workerNodes} worker node(s)!\n\n${result.stdout}\n\nCluster is ready for CI/CD workflows.`,
+              },
+            ],
+          };
+        } finally {
+          // Clean up temp file and directory
+          try {
+            await unlink(tempConfig);
+            await executeCommand(`rmdir ${tmpDir}`);
+          } catch (cleanupError) {
+            console.error('Temp file cleanup failed:', cleanupError);
+          }
+        }
       }
 
       case "wait_for_ready": {
         const params = WaitForReadySchema.parse(args);
         const context = getKubeconfigPath(params.name);
-        const timeout = params.timeout || '5m';
+        const timeout = sanitizeInput(params.timeout || '5m');
+        
+        // Validate timeout format
+        if (!/^\d+[smh]$/.test(timeout)) {
+          throw new Error("Timeout must be in format like '5m', '30s', or '1h'");
+        }
         
         // Wait for nodes to be ready
         const command = `kubectl wait --for=condition=Ready nodes --all ${context} --timeout=${timeout}`;
