@@ -611,8 +611,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let command = `kubectl exec ${sanitizeInput(params.pod)} ${context}`;
         if (params.namespace) command += ` -n ${sanitizeInput(params.namespace)}`;
         if (params.container) command += ` -c ${sanitizeInput(params.container)}`;
-        // Note: params.command is passed as-is to kubectl, which handles it safely
-        command += ` -- ${params.command}`;
+        
+        // Note: The command is executed inside the pod container via kubectl exec.
+        // kubectl safely handles the command after '--' and passes it to the container.
+        // However, we still need to be careful about shell injection at our level.
+        // We use single quotes to prevent shell expansion on the host system.
+        command += ` -- sh -c '${params.command.replace(/'/g, "'\\''")}'`;
         
         const result = await executeCommand(command);
         return {
