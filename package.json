@@ -1,0 +1,35 @@
+{
+  "name": "kind-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for KIND (Kubernetes IN Docker) cluster management and operations",
+  "type": "module",
+  "bin": {
+    "kind-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "kind",
+    "kubernetes",
+    "docker",
+    "development",
+    "cluster",
+    "k8s"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
